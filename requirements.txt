@@ -1,0 +1,6 @@
+sentence-transformers
+PyMuPDF
+langchain
+numpy
+google-generativeai
+dataclasses; python_version < '3.7'

@@ -1,74 +1,31 @@
+import streamlit as st
 from sentence_transformers import SentenceTransformer
 import fitz  # PyMuPDF
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import numpy as np
 import google.generativeai as genai
-import os
-from typing import List, Dict
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
+from typing import List, Dict
+from io import BytesIO
 
+# ----- Data Classes -----
 @dataclass
 class QuestionResponse:
     correct_option: str
     explanation: str
     source: str
 
-
 class ChunkWithSource:
     def __init__(self, text: str, source: str):
         self.text = text
         self.source = source
 
-def process_pdfs(folder_path: str) -> List[ChunkWithSource]:
-    chunks_with_sources = []
-    pdf_files = get_pdf_files(folder_path)
-    
-    for pdf_path in pdf_files:
-        filename = os.path.basename(pdf_path)
-        text = extract_text_from_pdf(pdf_path)
-        chunks = split_text_into_chunks(text)
-        
-        for chunk in chunks:
-            chunks_with_sources.append(ChunkWithSource(chunk, filename))
-    
-    return chunks_with_sources
-
-
-
-def get_pdf_files(folder_path: str) -> List[str]:
-    """Get all PDF files from the specified folder."""
-    pdf_files = []
-    for file in os.listdir(folder_path):
-        if file.endswith('.pdf'):
-            pdf_files.append(os.path.join(folder_path, file))
-    return pdf_files
-
-class ConversationMemory:
-    def __init__(self, max_history: int = 5):
-        self.history: List[Dict] = []
-        self.max_history = max_history
-
-    def add_interaction(self, query: str, response: str, context: str):
-        self.history.append({
-            "query": query,
-            "response": response,
-            "context": context
-        })
-        if len(self.history) > self.max_history:
-            self.history.pop(0)
-
-    def get_formatted_history(self) -> str:
-        formatted = ""
-        for interaction in self.history:
-            formatted += f"Question: {interaction['query']}\n"
-            formatted += f"Answer: {interaction['response']}\n"
-        return formatted
-
-def extract_text_from_pdf(pdf_path):
+# ----- Utilities -----
+def extract_text_from_pdf_bytes(file_bytes):
     text = ""
-    with fitz.open(pdf_path) as doc:
-        for page_num, page in enumerate(doc, start=1):
+    with fitz.open("pdf", file_bytes) as doc:
+        for page in doc:
             text += page.get_text()
     return text
 
@@ -79,73 +36,84 @@ def split_text_into_chunks(text, chunk_size=1000, chunk_overlap=200):
         separators=["\n\n", "\n", ".", "!", "?", " ", ""]
     )
     return splitter.split_text(text)
-    
+
 def sentence_encode(sentences):
     model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-    embeddings = model.encode(sentences)
-    return embeddings
+    return model.encode(sentences)
 
 def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-    
-if __name__ == "__main__":
-    # Specify your PDFs folder path
-    folder_path = "/Users/rudrabhaskar/Desktop/ML-main/ML/Folder_with_pdfs"
-    
-    # Process all PDFs with source tracking
-    chunks_with_sources = process_pdfs(folder_path)
-    if not chunks_with_sources:
-        print("No PDF files found in the specified folder!")
-        exit()
-    
-    # Extract just the text for embeddings
-    all_chunks = [chunk.text for chunk in chunks_with_sources]
-    print(f"Total chunks created: {len(all_chunks)}")
-    
-    # Create embeddings for all chunks
-    chunk_vectors = sentence_encode(all_chunks)
-    
-    # Initialize conversation memory
-    memory = ConversationMemory()
 
-    while True:
-        # Get user input
-        query = input("\nEnter your question (or 'quit' to exit): ")
-        
-        if query.lower() == 'quit':
-            break
-            
-        query_vector = sentence_encode([query])
-        top_k = 3
-        
-        similarities = []
-        for idx, chunk_vec in enumerate(chunk_vectors):
-            sim = cosine_similarity(chunk_vec, query_vector[0])
-            similarities.append((sim, idx))
-        
-        print("Similarities:", similarities)
+# ----- Conversation Memory -----
+class ConversationMemory:
+    def __init__(self, max_history: int = 5):
+        self.history: List[Dict] = []
+        self.max_history = max_history
 
-        print("==" * 20)
+    def add_interaction(self, query: str, response: str, context: str):
+        self.history.append({"query": query, "response": response, "context": context})
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
 
-        # Sort by similarity descending and get top_k indices
-        top_chunks = sorted(similarities, reverse=True)[:top_k]
-        top_indices = [idx for _, idx in top_chunks]
+    def get_formatted_history(self) -> str:
+        return "\n".join(
+            f"Question: {h['query']}\nAnswer: {h['response']}\n"
+            for h in self.history
+        )
 
-        print("Top chunk indices:", top_indices)
+# ----- Streamlit App -----
+st.set_page_config(page_title="📘 Gemini PDF QA", layout="wide")
+st.title("📘 Gemini PDF QA System")
+st.markdown("Upload PDFs and ask questions to get structured answers in JSON format.")
 
-        new_context = ""
-        for i in top_indices:
-            new_context += all_chunks[i] + "\n"
+uploaded_files = st.file_uploader("📂 Upload one or more PDF files", type="pdf", accept_multiple_files=True)
 
-        GOOGLE_API_KEY = "AIzaSyBqqT1xFUv4iMDViJ8dIJHlD_kM7_T0fE4"
+# Initialize session state
+if "chunks_with_sources" not in st.session_state:
+    st.session_state.chunks_with_sources = []
+    st.session_state.chunk_vectors = []
+    st.session_state.text_chunks = []
+    st.session_state.memory = ConversationMemory()
 
-          # Create history-aware prompt
-        conversation_history = memory.get_formatted_history()
-        prompt_template = f"""You are an assistant that provides answers in JSON format.
+# Process uploaded PDFs
+if uploaded_files and st.button("📄 Process PDFs"):
+    chunks = []
+    for file in uploaded_files:
+        file_bytes = file.read()
+        text = extract_text_from_pdf_bytes(file_bytes)
+        for chunk in split_text_into_chunks(text):
+            chunks.append(ChunkWithSource(chunk, file.name))
 
-Current Context (from {chunks_with_sources[top_indices[0]].source}):
+    st.session_state.chunks_with_sources = chunks
+    st.session_state.text_chunks = [c.text for c in chunks]
+    st.session_state.chunk_vectors = sentence_encode(st.session_state.text_chunks)
+    st.success(f"✅ Loaded {len(uploaded_files)} PDFs and created {len(chunks)} chunks.")
+
+# Ask a question
+query = st.text_input("❓ Ask your question")
+generate = st.button("🧠 Generate Answer")
+
+if generate and query:
+    if "chunk_vectors" not in st.session_state or len(st.session_state.chunk_vectors) == 0:
+        st.error("⚠️ Please upload and process PDFs first.")
+    else:
+        query_vector = sentence_encode([query])[0]
+        similarities = [
+            (cosine_similarity(v, query_vector), idx)
+            for idx, v in enumerate(st.session_state.chunk_vectors)
+        ]
+        top_k = sorted(similarities, reverse=True)[:3]
+        top_indices = [idx for _, idx in top_k]
+        new_context = "\n".join(st.session_state.text_chunks[i] for i in top_indices)
+
+        # Gemini API key
+        GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
+        genai.configure(api_key=GOOGLE_API_KEY)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+
+        prompt = f"""You are an assistant that provides answers in JSON format.
+
+Current Context (from {st.session_state.chunks_with_sources[top_indices[0]].source}):
 {new_context}
 
 Question: {query}
@@ -154,31 +122,23 @@ Respond ONLY with a JSON object in this exact format:
 {{
     "correct_option": "The correct answer",
     "explanation": "Detailed explanation of why this is correct",
-    "source": "{chunks_with_sources[top_indices[0]].source}"
+    "source": "{st.session_state.chunks_with_sources[top_indices[0]].source}"
 }}"""
 
         try:
-            # Configure the API
-            genai.configure(api_key=GOOGLE_API_KEY)
-            
-            # Initialize the model correctly
-            model = genai.GenerativeModel('gemini-2.0-flash')
-            
-            # Generate response with the actual prompt
-            response = model.generate_content(prompt_template)
-            
-            # Parse JSON response
-            try:
-                json_response = json.loads(response.text)
-                print("\nFormatted Response:")
-                print(json.dumps(json_response, indent=2))
-                
-                # Store interaction in memory
-                memory.add_interaction(query, json.dumps(json_response), new_context)
-                
-            except json.JSONDecodeError as je:
-                print(f"Error parsing JSON response: {je}")
-                print("Raw response:", response.text)
-                
+            response = model.generate_content(prompt)
+            json_response = json.loads(response.text)
+
+            st.subheader("📦 JSON Response")
+            st.json(json_response)
+
+            st.session_state.memory.add_interaction(query, json.dumps(json_response), new_context)
+        except json.JSONDecodeError:
+            st.error("❌ Failed to parse JSON response.")
+            st.text(response.text)
         except Exception as e:
-            print(f"Error generating response: {str(e)}")
+            st.error(f"❌ Error generating response: {str(e)}")
+
+# Show conversation history
+with st.expander("📜 Conversation History"):
+    st.text(st.session_state.memory.get_formatted_history())
